@@ -27,13 +27,15 @@ with no API key).
 
 import argparse
 import os
+import secrets
 import sys
 import tempfile
 import uuid
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
 
 import infinite_world as iw
 from asset_retrieval import HSSDRetriever, TieredRetriever
@@ -48,11 +50,78 @@ app = Flask(__name__)
 app.config["RETRIEVER"] = None
 app.config["USE_MOCK"] = True
 app.config["HSSD_ROOT"] = None
+app.config["PASSWORD"] = None
+# Random per-process secret for signing the login session cookie — no
+# reason for this to survive a restart (everyone just re-enters the
+# password once, same as any session timeout), so a fresh one each launch
+# is simpler than managing a persisted secret file.
+app.secret_key = secrets.token_hex(32)
 # In-memory theme store: theme_id -> theme dict. Fine for a single-user
 # local app — no database needed, and nothing here needs to survive a
 # server restart (a restarted server just can't resolve old themeIds
 # anymore, handled explicitly below rather than crashing).
 _themes = {}
+
+_LOGIN_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Login</title>
+<style>
+  body {{ font: 15px -apple-system, Segoe UI, Roboto, sans-serif; background:#1c1f24;
+          color:#eee; display:flex; align-items:center; justify-content:center;
+          height:100vh; margin:0; }}
+  form {{ background:#25292f; padding:28px 32px; border-radius:10px; text-align:center; }}
+  input[type=password] {{ padding:8px 10px; border-radius:6px; border:1px solid #444;
+                           background:#1c1f24; color:#eee; font-size:15px; }}
+  button {{ padding:8px 16px; border-radius:6px; border:none; background:#3b82f6;
+            color:#fff; font-size:15px; cursor:pointer; margin-left:8px; }}
+  .err {{ color:#ff8080; margin-bottom:12px; }}
+</style></head>
+<body>
+  <form method="post">
+    {error_html}
+    <input type="password" name="password" placeholder="Password" autofocus>
+    <button type="submit">Enter</button>
+  </form>
+</body></html>
+"""
+
+
+@app.before_request
+def _require_password():
+    """
+    Gates every route behind a single shared password (see --password /
+    WEBAPP_PASSWORD) once one is configured — added specifically for
+    running this behind a public tunnel (ngrok/cloudflared/etc), where
+    anyone with the URL could otherwise trigger real, billed LLM calls on
+    the server operator's own API key with no restriction at all. Uses a
+    signed Flask session cookie so the browser only has to enter the
+    password once per session, not on every request; /api/* routes return
+    a 401 JSON body instead of a redirect since those are called via
+    fetch(), not navigated to directly, and a redirect response there
+    would just look like a confusing failure to the page's own JS.
+    Entirely a no-op (returns immediately) if no password is configured at
+    all — the original localhost-only, single-user behavior.
+    """
+    if not app.config["PASSWORD"]:
+        return None
+    if request.path == "/login" or request.path.startswith("/login"):
+        return None
+    if session.get("authed"):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="unauthorized — log in at /login first"), 401
+    return redirect("/login?next=" + quote(request.path, safe=""))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if app.config["PASSWORD"] and secrets.compare_digest(pw, app.config["PASSWORD"]):
+            session.permanent = True
+            session["authed"] = True
+            return redirect(request.args.get("next") or "/")
+        return _LOGIN_PAGE.format(error_html='<div class="err">Wrong password.</div>'), 401
+    return _LOGIN_PAGE.format(error_html="")
 
 
 @app.route("/")
@@ -148,6 +217,12 @@ def main():
                      help="force the deterministic/no-network synthesizer even if "
                           "OPENAI_API_KEY is set (useful for trying the app with no key).")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--password", default=os.environ.get("WEBAPP_PASSWORD"),
+                     help="shared password required to use this server (checked at "
+                          "/login, gates every route). Falls back to the "
+                          "WEBAPP_PASSWORD environment variable. REQUIRED before "
+                          "exposing this server publicly (e.g. via ngrok/cloudflared) "
+                          "— with neither set, there is no password gate at all.")
     args = ap.parse_args()
 
     # Regenerated on every startup, not committed/hand-maintained — it has
@@ -160,6 +235,13 @@ def main():
     render_infinite_shell_html(os.path.join(STATIC_DIR, "infinite.html"))
     app.config["USE_MOCK"] = args.mock or "OPENAI_API_KEY" not in os.environ
     app.config["HSSD_ROOT"] = args.hssd_root
+    app.config["PASSWORD"] = args.password
+    if args.password:
+        print("[webapp] password gate: ON — every route requires /login first")
+    else:
+        print("[webapp] WARNING: no password set (--password or WEBAPP_PASSWORD) — "
+              "this server has NO access control. Fine for localhost-only use; do "
+              "NOT expose it via a tunnel (ngrok/cloudflared/etc) without setting one.")
     print(f"[webapp] building the shared HSSD retriever from {args.hssd_root!r} "
           f"(once, at startup)...")
     app.config["RETRIEVER"] = TieredRetriever([HSSDRetriever(hssd_root=args.hssd_root)])
