@@ -372,3 +372,8 @@ resulting retriever into this harness (one class, matching
    ```bash
    node viewer_stub_test.js out3d/viewer_0.html
    ```
+## References
+
+- [InteriorAgent]([https://github.com/InteriorAgent/InteriorAgent](https://openreview.net/pdf?id=ypBfokcXvA)
+- [HSSD Dataset](https://huggingface.co/datasets/hssd/hssd-hab) 
+- [Minecraft Open-Ended World Generation](https://github.com/mindcraft-bots/mindcraft)
