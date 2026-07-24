@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>3D Agent Harness</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; background: #14161a; color: #eee;
+               font: 15px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #9aa0a8; margin-bottom: 28px; font-size: 14px; }
+  label { display: block; font-size: 13px; color: #b7bcc3; margin: 18px 0 6px; }
+  textarea, input[type=text] {
+    width: 100%; box-sizing: border-box; background: #1d2025; color: #eee;
+    border: 1px solid #33383f; border-radius: 8px; padding: 10px 12px;
+    font: inherit; resize: vertical;
+  }
+  textarea { min-height: 64px; }
+  .row { display: flex; gap: 10px; margin-top: 8px; }
+  .choice {
+    flex: 1; border: 1px solid #33383f; border-radius: 8px; padding: 12px;
+    cursor: pointer; text-align: center; user-select: none; transition: border-color .15s, background .15s;
+  }
+  .choice:hover { border-color: #4a5057; }
+  .choice.selected { border-color: #7ec8ff; background: #1a2733; }
+  .choice input { display: none; }
+  .choice .t { font-weight: 600; }
+  .choice .d { font-size: 12px; color: #9aa0a8; margin-top: 3px; }
+  #taskWrap.disabled { opacity: 0.4; pointer-events: none; }
+  button#go {
+    margin-top: 26px; width: 100%; padding: 13px; font: inherit; font-weight: 600;
+    background: #2f6fb0; color: white; border: none; border-radius: 8px; cursor: pointer;
+  }
+  button#go:hover { background: #3a80c4; }
+  button#go:disabled { background: #2a3038; color: #777; cursor: default; }
+  #status { margin-top: 14px; font-size: 13px; color: #9aa0a8; min-height: 18px; }
+  #status.error { color: #ff8a8a; }
+  #result { margin-top: 20px; }
+  #result iframe { width: 100%; height: 78vh; border: 1px solid #33383f; border-radius: 8px; }
+  .hint { font-size: 12px; color: #6f7580; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>3D Agent Harness</h1>
+  <div class="sub">Text prompt &rarr; generated 3D scene, using real HSSD meshes &rarr; navigate it yourself or watch the agent do it.</div>
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="a kitchen with a can on the counter and a trash bin in the corner"></textarea>
+
+  <div id="taskWrap">
+    <label for="task">Task (optional &mdash; only used in Scene mode)</label>
+    <input type="text" id="task" placeholder="pick the can and place it in the trash bin">
+    <div class="hint">Leave blank for a simple "reach the goal object" task. For pick-and-place, phrase it like the placeholder above.</div>
+  </div>
+
+  <label>Control</label>
+  <div class="row" id="controlRow">
+    <label class="choice selected" data-value="auto">
+      <input type="radio" name="control" value="auto" checked>
+      <div class="t">Auto</div>
+      <div class="d">Agent navigates itself</div>
+    </label>
+    <label class="choice" data-value="manual">
+      <input type="radio" name="control" value="manual">
+      <div class="t">Manual</div>
+      <div class="d">You drive (WASD + mouse)</div>
+    </label>
+  </div>
+
+  <label>Mode</label>
+  <div class="row" id="modeRow">
+    <label class="choice selected" data-value="scene">
+      <input type="radio" name="mode" value="scene" checked>
+      <div class="t">Scene</div>
+      <div class="d">One bounded room from your prompt</div>
+    </label>
+    <label class="choice" data-value="infinite">
+      <input type="radio" name="mode" value="infinite">
+      <div class="t">Infinite</div>
+      <div class="d">A never-ending corridor, ~30s, no boundaries</div>
+    </label>
+  </div>
+
+  <button id="go">Generate</button>
+  <div id="status"></div>
+  <div id="result"></div>
+</div>
+
+<script>
+const promptEl = document.getElementById("prompt");
+const taskEl = document.getElementById("task");
+const taskWrap = document.getElementById("taskWrap");
+const statusEl = document.getElementById("status");
+const resultEl = document.getElementById("result");
+const goBtn = document.getElementById("go");
+
+function wireChoiceRow(rowId, onChange) {
+  const row = document.getElementById(rowId);
+  const choices = [...row.querySelectorAll(".choice")];
+  choices.forEach((c) => {
+    c.addEventListener("click", () => {
+      choices.forEach((o) => o.classList.remove("selected"));
+      c.classList.add("selected");
+      c.querySelector("input").checked = true;
+      onChange(c.dataset.value);
+    });
+  });
+}
+wireChoiceRow("controlRow", () => {});
+wireChoiceRow("modeRow", (mode) => {
+  taskWrap.classList.toggle("disabled", mode === "infinite");
+});
+
+function getSelected(rowId) {
+  return document.querySelector(`#${rowId} input:checked`).value;
+}
+
+function setStatus(msg, isError) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle("error", !!isError);
+}
+
+goBtn.addEventListener("click", async () => {
+  const prompt = promptEl.value.trim();
+  if (!prompt) { setStatus("Type a prompt first.", true); return; }
+  const control = getSelected("controlRow");
+  const mode = getSelected("modeRow");
+
+  goBtn.disabled = true;
+  resultEl.innerHTML = "";
+  setStatus(mode === "infinite"
+    ? "Deriving a theme and generating the first stretch of corridor…"
+    : "Synthesizing your scene (LLM + HSSD retrieval)— this can take a little while…");
+
+  try {
+    if (mode === "scene") {
+      const task = taskEl.value.trim();
+      const resp = await fetch("/api/scene", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, task, control }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || `server returned ${resp.status}`);
+      }
+      const html = await resp.text();
+      const iframe = document.createElement("iframe");
+      resultEl.appendChild(iframe);
+      iframe.srcdoc = html;
+      setStatus("Done — use the viewer above (TAB toggles auto/manual, WASD to move manually).");
+    } else {
+      // infinite.html itself calls /api/infinite/start on load (see
+      // viewer3d.JS_STREAMING_DRIVER) — the response embeds real HSSD
+      // meshes and can run to tens of MB, which sessionStorage's ~5-10MB
+      // per-origin quota can't hold (confirmed: a real run threw
+      // "Setting the value of 'infiniteStart' exceeded the quota" the
+      // instant a chunk's furniture got real embedded meshes instead of
+      // primitive shapes). Passing only the prompt/control through the
+      // URL avoids ever needing to store that payload anywhere at all —
+      // it just stays in memory as the fetch() response on the
+      // destination page.
+      const url = "/static/infinite.html?prompt=" + encodeURIComponent(prompt)
+                + "&control=" + encodeURIComponent(control);
+      window.location.href = url;
+      return;
+    }
+  } catch (e) {
+    setStatus("Error: " + e.message, true);
+  } finally {
+    goBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
